@@ -7,6 +7,7 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
+    use rand::prelude::*;
 
     async fn start_test_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -59,11 +60,36 @@ mod tests {
         let base_url = start_test_server().await;
 
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "PUT name Alice").unwrap();
-        writeln!(file, "PUT age 30").unwrap();
-        writeln!(file, "GET name").unwrap();
-        writeln!(file, "GET age").unwrap();
-        writeln!(file, "GET missing_key").unwrap();
+        let mut rng = rand::rng();
+        let n: i32 = rng.random_range(0..10);
+
+
+        writeln!(file, "PUT 0 0").unwrap();
+        writeln!(file, "PUT 1 1").unwrap();
+        writeln!(file, "PUT 2 2").unwrap();
+        writeln!(file, "PUT 3 3").unwrap();
+        writeln!(file, "PUT 4 4").unwrap();
+        writeln!(file, "PUT 5 5").unwrap();
+        writeln!(file, "PUT 6 6").unwrap();
+        writeln!(file, "PUT 7 7").unwrap();
+        writeln!(file, "PUT 8 8").unwrap();
+        writeln!(file, "PUT 9 9").unwrap();
+
+        for i in 0..60000 {
+            let req_type: i32 = rng.random_range(0..2);
+            let key: u32 = rng.random_range(0..10);
+            let value: u32 = rng.random();
+            if n == 0 {
+                writeln!(file, "PUT {key} {value}").unwrap();
+            } else {
+                let missing_key = rng.random_range(0..2);
+                if missing_key == 0 {
+                    writeln!(file, "GET MISSING").unwrap();
+                } else {
+                    writeln!(file, "GET {key}").unwrap();
+                }
+            }
+        }
 
         let contents = std::fs::read_to_string(file.path()).unwrap();
         run_test_file(&base_url, &contents).await;
