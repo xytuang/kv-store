@@ -10,7 +10,9 @@ use axum::{
 };
 
 pub fn build_app() -> Router {
-    let shared_state = Arc::new(Mutex::new(KVStore::new()));
+    let shared_state = Arc::new(Mutex::new(KVStore::new(
+        "/Users/txy/Desktop/kv-store/data".to_string(),
+    )));
     Router::new()
         .route("/get/{key}", get(get_key))
         .route("/put/{key}", put(put_key))
