@@ -727,6 +727,7 @@ name = "kv-store"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "libc",
  "rand 0.10.1",
  "regex",
  "reqwest",

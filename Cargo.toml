@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
+libc = "0.2.186"
 rand = { version = "0.10.1", features = ["thread_rng"] }
 regex = "1.12.3"
 reqwest = { version = "0.13.3", features = ["json"] }
