@@ -1,12 +1,12 @@
 use crate::server::storage::KVStore;
-use crate::utils::{GetResponse, PutRequest, PutResponse};
+use crate::utils::{GetResponse, PutRequest, PutResponse, DeleteResponse};
 use ::std::sync::{Arc, Mutex};
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, put},
+    routing::{get, put, delete},
 };
 
 pub fn build_app() -> Router {
@@ -16,6 +16,7 @@ pub fn build_app() -> Router {
     Router::new()
         .route("/get/{key}", get(get_key))
         .route("/put/{key}", put(put_key))
+        .route("/delete/{key}", delete(delete_key))
         .with_state(shared_state)
 }
 
@@ -51,6 +52,19 @@ async fn put_key(
         StatusCode::OK,
         Json(PutResponse {
             message: "Key set".to_string(),
+        }),
+    )
+}
+
+async fn delete_key(
+    State(state): State<Arc<Mutex<KVStore>>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    state.lock().unwrap().delete(&key);
+    (
+        StatusCode::OK,
+        Json(DeleteResponse {
+            message: "Key deleted".to_string(),
         }),
     )
 }

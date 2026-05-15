@@ -50,6 +50,12 @@ mod tests {
                         );
                     }
                 }
+                "DELETE" => {
+                    let key = parts[1];
+                    let resp = client::delete(&http, base_url, key).await.unwrap();
+                    assert_eq!(resp.message, "Key deleted", "DELETE {key} failed");
+                    expected.remove(key);
+                }
                 _ => panic!("Unknown operation: {line}"),
             }
         }
@@ -91,7 +97,7 @@ mod tests {
     async fn test_from_file() {
         let base_url = start_test_server().await;
 
-        let path = std::path::Path::new("tests/fixtures/basic.txt");
+        let path = std::path::Path::new("tests/fixtures/delete.txt");
         if !path.exists() {
             return;
         }

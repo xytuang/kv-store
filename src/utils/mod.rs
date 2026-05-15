@@ -15,3 +15,8 @@ pub struct GetResponse {
 pub struct PutResponse {
     pub message: String,
 }
+
+#[derive(Deserialize, Serialize)]
+pub struct DeleteResponse {
+    pub message: String,
+}
