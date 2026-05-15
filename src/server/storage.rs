@@ -143,6 +143,7 @@ impl KVStore {
         let mut sst_file: File = File::create(&sst_path).unwrap();
         sst_file.write_all(json.as_bytes()).unwrap();
         sst_file.sync_all().unwrap();
+        self.fsync_parent_dir(Path::new(&sst_path)).unwrap();
 
         // 2. Atomically update the manifest via tmp file
         let manifest_path = format!("{}/MANIFEST.txt", self.data_dir);
