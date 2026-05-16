@@ -1,18 +1,12 @@
 use libc;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashSet, BinaryHeap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Info {
-    value: String,
-    deleted: bool
-}
+use crate::server::table::{Memtable, MemtableIter, SSTableIter, Entry, Info};
 
 #[derive(Debug)]
 pub enum KVError {
@@ -22,10 +16,42 @@ pub enum KVError {
 
 #[derive(Clone)]
 pub struct KVStore {
-    memtable: HashMap<String, Info>,
+    memtable: Memtable,
     next_id: u64,
     data_dir: String,
-    insertion_count: u64
+    update_count: u64
+}
+
+// HeapEntry struct specifically for compaction
+struct HeapEntry {
+    key: String,
+    age: usize,
+    iter_idx: usize,
+    info: Info
+}
+
+// Enables equality and inequality comparisons. PartialEq does not require reflextivity
+// PartialEq must be implemented before Eq as Eq is a subtrait of PartialEq
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool { self.key == other.key && self.age == other.age }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
+impl Ord for HeapEntry {
+    // VERY CURSED SEMANTICS
+    // Heap pop element that cmp considers the greatest
+    // When we do heap.pop on two entries A and B, we are doing A.cmp(&B) ie. A is self, B is other
+    // For A to pop first, A must be considered Greatest.
+    // This means that A.cmp(&B) must return Greater
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap by key, break ties by age (lower = newer = higher priority)
+        other.key.cmp(&self.key).then(other.age.cmp(&self.age))
+    }
 }
 
 impl KVStore {
@@ -47,23 +73,29 @@ impl KVStore {
         next_id
     }
 
-    fn replay_wal(wal_path: &str, memtable: &mut HashMap<String, Info>) {
+    fn replay_wal(wal_path: &str, memtable: &mut Memtable) {
         let file = File::open(wal_path).unwrap();
         let reader = BufReader::new(file);
 
         for line in reader.lines() {
             let line = line.unwrap();
             let v: Value = serde_json::from_str(&line).unwrap();
+            let op = v["op"].as_str().unwrap();
             let key = v["key"].as_str().unwrap();
-            let value = v["value"].as_str().unwrap();
-            memtable.insert(key.to_string(), Info {value: value.to_string(), deleted: false});
+
+            if op == "put" {
+                let value = v["value"].as_str().unwrap();
+                memtable.insert(Entry::new(key.to_string(), Info {value: value.to_string(), deleted: false}));
+            } else {
+                memtable.insert(Entry::new(key.to_string(), Info {value: "0".to_string(), deleted: true}));
+            }
         }
     }
 
     pub fn new(data_dir: String) -> Self {
         let manifest_path = format!("{}/MANIFEST.txt", data_dir);
         let wal_path = format!("{}/wal.db", data_dir);
-        let mut memtable = HashMap::<String, Info>::new();
+        let mut memtable = Memtable::new();
 
         let mut next_id: u64 = 0;
         if !fs::exists(&manifest_path).unwrap() {
@@ -84,25 +116,20 @@ impl KVStore {
             memtable,
             next_id,
             data_dir,
-            insertion_count: 0
+            update_count: 0
         }
     }
 
     pub fn get(&self, key: &str) -> Result<String, String> {
-        if let Ok(value) = self.search_memtable(key) {
-            return Ok(value);
+        match self.memtable.get(key) {
+            Ok(value) => return Ok(value),
+            Err(KVError::Deleted) => return  Err(format!("Key {key} not found")),
+            _ => ()
         }
         if let Ok(value) = self.search_sstables(key) {
             return Ok(value);
         }
         Err(format!("Key {key} not found"))
-    }
-
-    fn search_memtable(&self, key: &str) -> Result<String, String> {
-        match self.memtable.get(key) {
-            Some(info) => Ok(info.value.to_string()),
-            None => Err(format!("Key {key} not found")),
-        }
     }
 
     fn search_sstables(&self, key: &str) -> Result<String, String> {
@@ -124,19 +151,14 @@ impl KVStore {
 
     fn search_sstable(&self, sstable_name: &str, key: &str) -> Result<String, KVError> {
         let path = format!("{}/{}", self.data_dir, sstable_name);
-        let data = fs::read_to_string(&path).unwrap();
-        let map: HashMap<String, Info> = serde_json::from_str(&data).unwrap();
 
-        match map.get(key) {
-            Some(info) => {
-                if info.deleted {
-                    Err(KVError::Deleted)
-                } else {
-                    Ok(info.value.to_string())
-                }
+        // Brute force linear scan over all keys. Can be optimized
+        for (k, info) in SSTableIter::new(&path) {
+            if key == k {
+                if info.deleted { return Err(KVError::Deleted); } else { return Ok(info.value); }
             }
-            None => Err(KVError::NotFound),
         }
+        Err(KVError::NotFound)
     }
 
     pub fn put(&mut self, key: String, value: String) {
@@ -148,28 +170,38 @@ impl KVStore {
             writeln!(wal, "{}", entry).unwrap();
             wal.sync_all().unwrap();
         }
-
-        self.memtable.insert(key, Info {value, deleted: false});
+        self.memtable.insert(Entry::new(key, Info{value: value, deleted: false}));
 
         if self.memtable.len() == 2000 {
             self.flush();
             self.memtable.clear();
         }
 
-        self.insertion_count += 1;
-        if self.insertion_count == 10000 {
+        self.update_count += 1;
+        if self.update_count == 10000 {
+            if self.memtable.len() > 0 {
+                self.flush();
+                self.memtable.clear();
+            }
             self.compact();
+            self.update_count = 0;
         }
     }
 
     fn flush(&mut self) {
-        let json = serde_json::to_string(&self.memtable).unwrap();
         let sst_name = format!("sst-{}.json", self.next_id);
         let sst_path = format!("{}/{}", self.data_dir, sst_name);
 
         // 1. Write and fsync the SSTable
         let mut sst_file: File = File::create(&sst_path).unwrap();
-        sst_file.write_all(json.as_bytes()).unwrap();
+
+        // MemtableIter sorts the keys
+        for (key, info) in MemtableIter::new(&self.memtable) {
+            let e = Entry::new(key, info);
+            let line = e.to_string();
+            writeln!(sst_file, "{}", line).unwrap();
+        }
+    
         sst_file.sync_all().unwrap();
         self.fsync_parent_dir(Path::new(&sst_path)).unwrap();
 
@@ -212,38 +244,61 @@ impl KVStore {
         let mut lines: Vec<_> = reader.lines().map(|line| line.unwrap()).collect();
         lines.reverse(); // newest first
 
-        // Merge all SSTables, newest wins
-        let mut merged: HashMap<String, Info> = HashMap::new();
+        // Create array of iterators.
+        let mut iters: Vec<Box<dyn Iterator<Item = (String, Info)>>> = vec![];
+
+        // Add iterators for SSTables in most recent order
         for line in lines.iter() {
             let path = format!("{}/{}", self.data_dir, line);
-            let data = fs::read_to_string(&path).unwrap();
-            let map: HashMap<String, Info> = serde_json::from_str(&data).unwrap();
-            for (key, info) in map {
-                merged.entry(key).or_insert(info); // newest already in map, don't overwrite
+            iters.push(Box::new(SSTableIter::new(&path)));
+        }
+
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+
+        // Add the first key of each iterator into the heap
+        for (idx, iter) in iters.iter_mut().enumerate() {
+            if let Some((key, info)) = iter.next() {
+                heap.push(HeapEntry {key: key, age: idx, iter_idx: idx, info: info});
             }
         }
 
-        // Drop tombstones
-        merged.retain(|_, info| !info.deleted);
+        // K way merge
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let mut output: Vec<(String, Info)> = Vec::new();
 
-        // Stream merged table to new SSTables
-        let mut key_iter = merged.keys();
-        let new_beginning_id = self.next_id; // Get the id of the first SSTable for new manifest
-        loop {
-            let chunk: Vec<&String> = key_iter.by_ref().take(2000).collect();
-            
-            if chunk.is_empty() {
-                break;
+        while let Some(heap_entry) = heap.pop() {
+            if let Some((next_key, next_info)) = iters[heap_entry.iter_idx].next() {
+                heap.push(HeapEntry {
+                    key: next_key,
+                    info: next_info,
+                    iter_idx: heap_entry.iter_idx,
+                    age: heap_entry.age
+                });
             }
 
+            // Skip older duplicates
+            if seen_keys.contains(&heap_entry.key) { continue; }
+            seen_keys.insert(heap_entry.key.clone());
+            if heap_entry.info.deleted { continue; }
+
+            output.push((heap_entry.key, heap_entry.info));
+        }
+
+        // Stream merged table to new SSTables
+        output.sort_by_key(|k| k.0.clone());
+
+        let new_beginning_id = self.next_id; // Get the id of the first SSTable for new manifest
+        for chunk in output.chunks(2000) {
             // Write single compacted SSTable
             let sst_name = format!("sst-{}.json", self.next_id);
             let sst_path = format!("{}/{}", self.data_dir, sst_name);
             let mut sst_file = File::create(&sst_path).unwrap();
-            let chunk_map: HashMap<&String, &Info> = chunk.iter()
-                .map(|k| (*k, merged.get(*k).unwrap()))
-                .collect();
-            sst_file.write_all(serde_json::to_string(&chunk_map).unwrap().as_bytes()).unwrap();
+
+            for (key, info) in chunk {
+                let e = Entry::new(key.to_string(), info.clone());
+                let line = e.to_string();
+                writeln!(sst_file, "{}", line).unwrap();
+            }
             sst_file.sync_all().unwrap();
             self.fsync_parent_dir(Path::new(&sst_path)).unwrap();
 
@@ -278,6 +333,17 @@ impl KVStore {
         writeln!(wal, "{}", entry).unwrap();
         wal.sync_all().unwrap();
 
-        self.memtable.insert(key.to_string(), Info {value: "0".to_string(), deleted: true});
+        self.memtable.insert(Entry::new(key.to_string(), Info {value: "0".to_string(), deleted: true}));
+
+        self.update_count += 1;
+
+        if self.update_count == 10000 {
+            if self.memtable.len() > 0 {
+                self.flush();
+                self.memtable.clear();
+            }
+            self.compact();
+            self.update_count = 0;
+        }
     }
 }

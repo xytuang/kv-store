@@ -73,6 +73,11 @@ pub async fn run_script(
                     println!("GET {key} → error: {}", resp.error);
                 }
             }
+            "DELETE" => {
+                let key = parts[1];
+                let resp = delete(client, base_url, key).await?;
+                println!("DELETE {key}: {}", resp.message);
+            }
             _ => eprintln!("Unknown operation: {line}"),
         }
     }
