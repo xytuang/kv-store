@@ -1,4 +1,4 @@
-use crate::utils::{GetResponse, PutResponse, DeleteResponse};
+use crate::utils::{DeleteResponse, GetResponse, PutResponse};
 use reqwest::Client;
 
 pub async fn get(
@@ -30,10 +30,15 @@ pub async fn put(
 pub async fn delete(
     client: &Client,
     base_url: &str,
-    key: &str
+    key: &str,
 ) -> Result<DeleteResponse, reqwest::Error> {
     let url = format!("{base_url}/delete/{key}");
-    client.delete(&url).send().await?.json::<DeleteResponse>().await
+    client
+        .delete(&url)
+        .send()
+        .await?
+        .json::<DeleteResponse>()
+        .await
 }
 
 pub async fn start(base_url: &str) -> Result<(), reqwest::Error> {

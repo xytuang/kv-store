@@ -1,12 +1,12 @@
+use crate::server::table::{Entry, Info, Memtable, MemtableIter, SSTableIter};
 use libc;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashSet, BinaryHeap};
+use std::collections::{BinaryHeap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use crate::server::table::{Memtable, MemtableIter, SSTableIter, Entry, Info};
 
 #[derive(Debug)]
 pub enum KVError {
@@ -17,37 +17,32 @@ pub enum KVError {
 #[derive(Clone)]
 pub struct KVStore {
     memtable: Memtable,
-    next_id: u64,
+    next_ids: Vec<usize>,
     data_dir: String,
-    update_count: u64
 }
 
-// HeapEntry struct specifically for compaction
 struct HeapEntry {
     key: String,
     age: usize,
     iter_idx: usize,
-    info: Info
+    info: Info,
 }
 
-// Enables equality and inequality comparisons. PartialEq does not require reflextivity
-// PartialEq must be implemented before Eq as Eq is a subtrait of PartialEq
 impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool { self.key == other.key && self.age == other.age }
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.age == other.age
+    }
 }
 
 impl Eq for HeapEntry {}
 
 impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Ord for HeapEntry {
-    // VERY CURSED SEMANTICS
-    // Heap pop element that cmp considers the greatest
-    // When we do heap.pop on two entries A and B, we are doing A.cmp(&B) ie. A is self, B is other
-    // For A to pop first, A must be considered Greatest.
-    // This means that A.cmp(&B) must return Greater
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Min-heap by key, break ties by age (lower = newer = higher priority)
         other.key.cmp(&self.key).then(other.age.cmp(&self.age))
@@ -55,22 +50,32 @@ impl Ord for HeapEntry {
 }
 
 impl KVStore {
-    fn get_next_id(manifest_path: &str) -> u64 {
-        let mut next_id: u64 = 0;
+    fn get_next_ids(manifest_path: &str, next_ids: &mut Vec<usize>) {
         let file = File::open(manifest_path).unwrap();
         let reader = BufReader::new(file);
+        let sst_regex = Regex::new(r"^(?P<name>[a-zA-Z0-9]+)-(?P<num>\d+)\.json$").unwrap();
+        let level_regex = Regex::new(r"^\[L\d+\]$").unwrap();
+        let mut in_level = false;
+        let mut next_id: usize = 0;
 
-        if let Some(last_line) = reader.lines().last() {
-            let re = Regex::new(r"^(?P<name>[a-zA-Z0-9]+)-(?P<num>\d+)\.json$").unwrap();
-
-            if let Some(caps) = re.captures(&last_line.unwrap()) {
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if level_regex.is_match(&line) {
+                if in_level {
+                    // Push the previous level's next_id before starting a new level
+                    next_ids.push(next_id);
+                }
+                next_id = 0;
+                in_level = true;
+            } else if let Some(caps) = sst_regex.captures(&line) {
                 let num = &caps["num"];
-                next_id = num.parse::<u64>().expect("Not a valid number") + 1;
-            } else {
-                eprintln!("Line did not match format");
+                next_id = num.parse::<usize>().expect("Not a valid number") + 1;
             }
         }
-        next_id
+        // Push the last level's next_id
+        if in_level {
+            next_ids.push(next_id);
+        }
     }
 
     fn replay_wal(wal_path: &str, memtable: &mut Memtable) {
@@ -85,9 +90,21 @@ impl KVStore {
 
             if op == "put" {
                 let value = v["value"].as_str().unwrap();
-                memtable.insert(Entry::new(key.to_string(), Info {value: value.to_string(), deleted: false}));
+                memtable.insert(Entry::new(
+                    key.to_string(),
+                    Info {
+                        value: value.to_string(),
+                        deleted: false,
+                    },
+                ));
             } else {
-                memtable.insert(Entry::new(key.to_string(), Info {value: "0".to_string(), deleted: true}));
+                memtable.insert(Entry::new(
+                    key.to_string(),
+                    Info {
+                        value: "0".to_string(),
+                        deleted: true,
+                    },
+                ));
             }
         }
     }
@@ -95,14 +112,30 @@ impl KVStore {
     pub fn new(data_dir: String) -> Self {
         let manifest_path = format!("{}/MANIFEST.txt", data_dir);
         let wal_path = format!("{}/wal.db", data_dir);
+        let l0_path = format!("{}/l0", data_dir);
         let mut memtable = Memtable::new();
 
-        let mut next_id: u64 = 0;
+        let mut next_ids: Vec<usize> = Vec::new();
         if !fs::exists(&manifest_path).unwrap() {
-            let file = File::create(&manifest_path).unwrap();
+            let mut file = File::create(&manifest_path).unwrap();
+            writeln!(file, "[L0]").unwrap();
             drop(file);
+            next_ids.push(0);
         } else {
-            next_id = Self::get_next_id(&manifest_path);
+            Self::get_next_ids(&manifest_path, &mut next_ids);
+        }
+
+        // Create level directories that don't exist yet
+        for i in 0..next_ids.len() {
+            let dir = format!("{}/l{}", data_dir, i);
+            if !fs::exists(&dir).unwrap() {
+                fs::create_dir(&dir).unwrap();
+            }
+        }
+
+        // Always ensure l0 exists
+        if !fs::exists(&l0_path).unwrap() {
+            fs::create_dir(&l0_path).unwrap();
         }
 
         if !fs::exists(&wal_path).unwrap() {
@@ -114,17 +147,16 @@ impl KVStore {
 
         Self {
             memtable,
-            next_id,
+            next_ids,
             data_dir,
-            update_count: 0
         }
     }
 
     pub fn get(&self, key: &str) -> Result<String, String> {
         match self.memtable.get(key) {
             Ok(value) => return Ok(value),
-            Err(KVError::Deleted) => return  Err(format!("Key {key} not found")),
-            _ => ()
+            Err(KVError::Deleted) => return Err(format!("Key {key} not found")),
+            _ => (),
         }
         if let Ok(value) = self.search_sstables(key) {
             return Ok(value);
@@ -134,28 +166,32 @@ impl KVStore {
 
     fn search_sstables(&self, key: &str) -> Result<String, String> {
         let manifest_path = format!("{}/MANIFEST.txt", self.data_dir);
-        let file = File::open(&manifest_path).unwrap();
-        let reader = BufReader::new(file);
-        let mut lines: Vec<_> = reader.lines().map(|line| line.unwrap()).collect();
-        lines.reverse();
+        let all_sst_filenames = self.parse_manifest(&manifest_path);
 
-        for line in lines.iter() {
-            match self.search_sstable(&line, key) {
-                Ok(value) => return Ok(value),
-                Err(KVError::Deleted) => return Err(format!("Key {key} not found")), // stop searching
-                Err(KVError::NotFound) => continue, // key not in this SSTable, keep looking
+        // Search L0 first (newest), then deeper levels
+        for (level, level_files) in all_sst_filenames.iter().enumerate() {
+            // Within a level, search newest SSTable first
+            for name in level_files.iter().rev() {
+                let path = format!("{}/l{}/{}", self.data_dir, level, name);
+                match self.search_sstable(&path, key) {
+                    Ok(value) => return Ok(value),
+                    Err(KVError::Deleted) => return Err(format!("Key {key} not found")),
+                    Err(KVError::NotFound) => continue,
+                }
             }
         }
+
         Err(format!("Key {key} not found"))
     }
 
-    fn search_sstable(&self, sstable_name: &str, key: &str) -> Result<String, KVError> {
-        let path = format!("{}/{}", self.data_dir, sstable_name);
-
-        // Brute force linear scan over all keys. Can be optimized
-        for (k, info) in SSTableIter::new(&path) {
+    fn search_sstable(&self, path: &str, key: &str) -> Result<String, KVError> {
+        for (k, info) in SSTableIter::new(path) {
             if key == k {
-                if info.deleted { return Err(KVError::Deleted); } else { return Ok(info.value); }
+                if info.deleted {
+                    return Err(KVError::Deleted);
+                } else {
+                    return Ok(info.value);
+                }
             }
         }
         Err(KVError::NotFound)
@@ -166,42 +202,33 @@ impl KVStore {
             let entry = serde_json::json!({"op": "put", "key": key, "value": value}).to_string();
             let wal_path = format!("{}/wal.db", self.data_dir);
             let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
-
             writeln!(wal, "{}", entry).unwrap();
             wal.sync_all().unwrap();
         }
-        self.memtable.insert(Entry::new(key, Info{value: value, deleted: false}));
+        self.memtable.insert(Entry::new(
+            key,
+            Info {
+                value: value,
+                deleted: false,
+            },
+        ));
 
         if self.memtable.len() == 2000 {
             self.flush();
             self.memtable.clear();
         }
-
-        self.update_count += 1;
-        if self.update_count == 10000 {
-            if self.memtable.len() > 0 {
-                self.flush();
-                self.memtable.clear();
-            }
-            self.compact();
-            self.update_count = 0;
-        }
     }
 
     fn flush(&mut self) {
-        let sst_name = format!("sst-{}.json", self.next_id);
-        let sst_path = format!("{}/{}", self.data_dir, sst_name);
+        let sst_name = format!("sst-{}.json", self.next_ids[0]);
+        let sst_path = format!("{}/l0/{}", self.data_dir, sst_name);
 
         // 1. Write and fsync the SSTable
         let mut sst_file: File = File::create(&sst_path).unwrap();
-
-        // MemtableIter sorts the keys
         for (key, info) in MemtableIter::new(&self.memtable) {
             let e = Entry::new(key, info);
-            let line = e.to_string();
-            writeln!(sst_file, "{}", line).unwrap();
+            writeln!(sst_file, "{}", e).unwrap();
         }
-    
         sst_file.sync_all().unwrap();
         self.fsync_parent_dir(Path::new(&sst_path)).unwrap();
 
@@ -209,21 +236,30 @@ impl KVStore {
         let manifest_path = format!("{}/MANIFEST.txt", self.data_dir);
         let tmp_path = format!("{}/MANIFEST.tmp", self.data_dir);
 
-        fs::copy(&manifest_path, &tmp_path).unwrap();
+        let mut tmp = File::create(&tmp_path).unwrap();
+        let mut all_sst_filenames = self.parse_manifest(&manifest_path);
+        all_sst_filenames[0].push(sst_name);
+        println!("{:?}", all_sst_filenames); 
 
-        let mut tmp = OpenOptions::new().append(true).open(&tmp_path).unwrap();
-        writeln!(tmp, "{}", sst_name).unwrap();
+        for (i, level_files) in all_sst_filenames.iter().enumerate() {
+            writeln!(tmp, "[L{}]", i).unwrap();
+            for name in level_files {
+                writeln!(tmp, "{}", name).unwrap();
+            }
+        }
         tmp.sync_all().unwrap();
         drop(tmp);
 
         fs::rename(&tmp_path, &manifest_path).unwrap();
         self.fsync_parent_dir(Path::new(&manifest_path)).unwrap();
-        self.next_id += 1;
+        self.next_ids[0] += 1;
 
-        // 3. Truncate and fsync the WAL now that flush is durable
+        // 3. Truncate and fsync the WAL
         let wal_path = format!("{}/wal.db", self.data_dir);
         let wal = File::create(&wal_path).unwrap();
         wal.sync_all().unwrap();
+
+        self.compact();
     }
 
     fn fsync_parent_dir(&self, path: &Path) -> std::io::Result<()> {
@@ -239,30 +275,42 @@ impl KVStore {
 
     fn compact(&mut self) {
         let manifest_path = format!("{}/MANIFEST.txt", self.data_dir);
-        let file = File::open(&manifest_path).unwrap();
-        let reader = BufReader::new(file);
-        let mut lines: Vec<_> = reader.lines().map(|line| line.unwrap()).collect();
-        lines.reverse(); // newest first
+        let mut all_sst_filenames = self.parse_manifest(&manifest_path);
+        self.compact_level(0, &mut all_sst_filenames);
+    }
 
-        // Create array of iterators.
+    fn compact_level(&mut self, level: usize, all_sst_filenames: &mut Vec<Vec<String>>) {
+        if level >= all_sst_filenames.len() || all_sst_filenames[level].len() < 5 {
+            return;
+        }
+
+        // Snapshot the filenames to compact and clear the level
+        let sst_filenames: Vec<String> = all_sst_filenames[level].clone();
+        let mut sorted_filenames = sst_filenames.clone();
+        sorted_filenames.reverse(); // newest first
+        all_sst_filenames[level].clear();
+
+        // Build iterators for each SSTable in this level
         let mut iters: Vec<Box<dyn Iterator<Item = (String, Info)>>> = vec![];
-
-        // Add iterators for SSTables in most recent order
-        for line in lines.iter() {
-            let path = format!("{}/{}", self.data_dir, line);
+        for sst_filename in sorted_filenames.iter() {
+            let path = format!("{}/l{}/{}", self.data_dir, level, sst_filename);
             iters.push(Box::new(SSTableIter::new(&path)));
         }
 
+        // Seed the heap
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
-
-        // Add the first key of each iterator into the heap
         for (idx, iter) in iters.iter_mut().enumerate() {
             if let Some((key, info)) = iter.next() {
-                heap.push(HeapEntry {key: key, age: idx, iter_idx: idx, info: info});
+                heap.push(HeapEntry {
+                    key,
+                    age: idx,
+                    iter_idx: idx,
+                    info,
+                });
             }
         }
 
-        // K way merge
+        // K-way merge
         let mut seen_keys: HashSet<String> = HashSet::new();
         let mut output: Vec<(String, Info)> = Vec::new();
 
@@ -272,45 +320,66 @@ impl KVStore {
                     key: next_key,
                     info: next_info,
                     iter_idx: heap_entry.iter_idx,
-                    age: heap_entry.age
+                    age: heap_entry.age,
                 });
             }
 
-            // Skip older duplicates
-            if seen_keys.contains(&heap_entry.key) { continue; }
+            if seen_keys.contains(&heap_entry.key) {
+                continue;
+            }
             seen_keys.insert(heap_entry.key.clone());
-            if heap_entry.info.deleted { continue; }
+            if heap_entry.info.deleted {
+                continue;
+            }
 
             output.push((heap_entry.key, heap_entry.info));
         }
 
-        // Stream merged table to new SSTables
-        output.sort_by_key(|k| k.0.clone());
+        output.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let new_beginning_id = self.next_id; // Get the id of the first SSTable for new manifest
+        // Ensure next level exists
+        let next_level = level + 1;
+        if self.next_ids.len() <= next_level {
+            self.create_new_level();
+            all_sst_filenames.push(Vec::new());
+        }
+
+        // Write compacted output to next level
+        let mut next_level_sst_filenames: Vec<String> = Vec::new();
         for chunk in output.chunks(2000) {
-            // Write single compacted SSTable
-            let sst_name = format!("sst-{}.json", self.next_id);
-            let sst_path = format!("{}/{}", self.data_dir, sst_name);
+            let sst_name = format!("sst-{}.json", self.next_ids[next_level]);
+            let sst_path = format!("{}/l{}/{}", self.data_dir, next_level, sst_name);
             let mut sst_file = File::create(&sst_path).unwrap();
 
             for (key, info) in chunk {
                 let e = Entry::new(key.to_string(), info.clone());
-                let line = e.to_string();
-                writeln!(sst_file, "{}", line).unwrap();
+                writeln!(sst_file, "{}", e).unwrap();
             }
             sst_file.sync_all().unwrap();
             self.fsync_parent_dir(Path::new(&sst_path)).unwrap();
 
-            self.next_id += 1;
+            self.next_ids[next_level] += 1;
+            next_level_sst_filenames.push(sst_name);
         }
 
-        // Rewrite manifest with just the compacted SSTable
+        // Append new files to existing next level list
+        all_sst_filenames[next_level].extend(next_level_sst_filenames);
+
+        // Delete old SSTable files from this level
+        for name in &sst_filenames {
+            let path = format!("{}/l{}/{}", self.data_dir, level, name);
+            fs::remove_file(&path).unwrap();
+        }
+
+        // Atomically rewrite manifest
+        let manifest_path = format!("{}/MANIFEST.txt", self.data_dir);
         let tmp_path = format!("{}/MANIFEST.tmp", self.data_dir);
         let mut tmp = File::create(&tmp_path).unwrap();
-        for i in new_beginning_id..self.next_id {
-            let sst_name = format!("sst-{}.json", i);
-            writeln!(tmp, "{}", sst_name).unwrap();
+        for (i, level_files) in all_sst_filenames.iter().enumerate() {
+            writeln!(tmp, "[L{}]", i).unwrap();
+            for name in level_files {
+                writeln!(tmp, "{}", name).unwrap();
+            }
         }
         tmp.sync_all().unwrap();
         drop(tmp);
@@ -318,10 +387,33 @@ impl KVStore {
         fs::rename(&tmp_path, &manifest_path).unwrap();
         self.fsync_parent_dir(Path::new(&manifest_path)).unwrap();
 
-        // Delete old SSTable files
-        for line in lines.iter() {
-            let path = format!("{}/{}", self.data_dir, line);
-            fs::remove_file(&path).unwrap();
+        // Recurse to compact next level if needed
+        self.compact_level(next_level, all_sst_filenames);
+    }
+
+    fn parse_manifest(&self, manifest_path: &str) -> Vec<Vec<String>> {
+        let file = File::open(manifest_path).unwrap();
+        let reader = BufReader::new(file);
+        let level_regex = Regex::new(r"^\[L\d+\]$").unwrap();
+        let mut all_sst_filenames: Vec<Vec<String>> = Vec::new();
+
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if level_regex.is_match(&line) {
+                all_sst_filenames.push(Vec::new());
+            } else if !line.trim().is_empty() {
+                all_sst_filenames.last_mut().unwrap().push(line);
+            }
+        }
+        all_sst_filenames
+    }
+
+    fn create_new_level(&mut self) {
+        let new_level = self.next_ids.len();
+        self.next_ids.push(0);
+        let directory_name = format!("{}/l{}", self.data_dir, new_level);
+        if !fs::exists(&directory_name).unwrap() {
+            fs::create_dir(&directory_name).unwrap();
         }
     }
 
@@ -329,21 +421,15 @@ impl KVStore {
         let entry = serde_json::json!({"op": "delete", "key": key}).to_string();
         let wal_path = format!("{}/wal.db", self.data_dir);
         let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
-
         writeln!(wal, "{}", entry).unwrap();
         wal.sync_all().unwrap();
 
-        self.memtable.insert(Entry::new(key.to_string(), Info {value: "0".to_string(), deleted: true}));
-
-        self.update_count += 1;
-
-        if self.update_count == 10000 {
-            if self.memtable.len() > 0 {
-                self.flush();
-                self.memtable.clear();
-            }
-            self.compact();
-            self.update_count = 0;
-        }
+        self.memtable.insert(Entry::new(
+            key.to_string(),
+            Info {
+                value: "0".to_string(),
+                deleted: true,
+            },
+        ));
     }
 }

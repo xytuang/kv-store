@@ -1,12 +1,12 @@
 use crate::server::storage::KVStore;
-use crate::utils::{GetResponse, PutRequest, PutResponse, DeleteResponse};
+use crate::utils::{DeleteResponse, GetResponse, PutRequest, PutResponse};
 use ::std::sync::{Arc, Mutex};
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, put, delete},
+    routing::{delete, get, put},
 };
 
 pub fn build_app() -> Router {

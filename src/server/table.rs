@@ -1,23 +1,22 @@
-use std::fs::File;
-use std::fmt;
-use std::io::{BufReader, BufRead};
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
-use serde_json;
 use crate::server::storage::KVError;
-
+use serde::{Deserialize, Serialize};
+use serde_json;
+use std::collections::HashMap;
+use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 
 #[derive(Deserialize, Serialize)]
 pub struct Entry {
     key: String,
     value: String,
-    deleted: bool
+    deleted: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Info {
     pub value: String,
-    pub deleted: bool
+    pub deleted: bool,
 }
 
 #[derive(Clone)]
@@ -28,7 +27,7 @@ pub struct Memtable {
 impl Memtable {
     pub fn new() -> Self {
         Self {
-            table: HashMap::<String, Info>::new()
+            table: HashMap::<String, Info>::new(),
         }
     }
 
@@ -46,7 +45,13 @@ impl Memtable {
     }
 
     pub fn insert(&mut self, entry: Entry) {
-        self.table.insert(entry.key, Info {value: entry.value, deleted: entry.deleted});
+        self.table.insert(
+            entry.key,
+            Info {
+                value: entry.value,
+                deleted: entry.deleted,
+            },
+        );
     }
 
     pub fn clear(&mut self) {
@@ -65,7 +70,8 @@ pub struct MemtableIter {
 
 impl MemtableIter {
     pub fn new(memtable: &Memtable) -> Self {
-        let mut entries: Vec<(String, Info)> = memtable.table
+        let mut entries: Vec<(String, Info)> = memtable
+            .table
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -88,13 +94,16 @@ impl Iterator for MemtableIter {
 }
 
 pub struct SSTableIter {
-    reader: BufReader<File>
+    reader: BufReader<File>,
 }
 
 impl SSTableIter {
     pub fn new(path: &str) -> Self {
+        eprintln!("Path: {path}");
         let file = File::open(path).unwrap();
-        Self { reader: BufReader::new(file) }
+        Self {
+            reader: BufReader::new(file),
+        }
     }
 }
 
@@ -110,7 +119,7 @@ impl Iterator for SSTableIter {
                 let key = v["key"].as_str().unwrap().to_string();
                 let value = v["value"].as_str().unwrap().to_string();
                 let deleted = v["deleted"].as_bool().unwrap();
-                Some((key, Info {value, deleted}))
+                Some((key, Info { value, deleted }))
             }
             Err(_) => None,
         }
@@ -119,13 +128,21 @@ impl Iterator for SSTableIter {
 
 impl Entry {
     pub fn new(key: String, info: Info) -> Self {
-        Self {key: key, value: info.value, deleted: info.deleted}
+        Self {
+            key: key,
+            value: info.value,
+            deleted: info.deleted,
+        }
     }
 }
 
 impl fmt::Display for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Use write! to send the formatted string to the formatter 'f'
-        write!(f, "{}", serde_json::json!({"key": self.key, "value": self.value, "deleted": self.deleted}))
+        write!(
+            f,
+            "{}",
+            serde_json::json!({"key": self.key, "value": self.value, "deleted": self.deleted})
+        )
     }
 }
