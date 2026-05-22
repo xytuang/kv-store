@@ -99,7 +99,6 @@ pub struct SSTableIter {
 
 impl SSTableIter {
     pub fn new(path: &str) -> Self {
-        eprintln!("Path: {path}");
         let file = File::open(path).unwrap();
         Self {
             reader: BufReader::new(file),

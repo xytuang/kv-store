@@ -21,6 +21,13 @@ pub struct KVStore {
     data_dir: String,
 }
 
+#[derive(Clone)]
+struct ManifestLine {
+    start_key: String,
+    end_key: String,
+    sst_name: String,
+}
+
 struct HeapEntry {
     key: String,
     age: usize,
@@ -171,12 +178,21 @@ impl KVStore {
         // Search L0 first (newest), then deeper levels
         for (level, level_files) in all_sst_filenames.iter().enumerate() {
             // Within a level, search newest SSTable first
-            for name in level_files.iter().rev() {
-                let path = format!("{}/l{}/{}", self.data_dir, level, name);
-                match self.search_sstable(&path, key) {
-                    Ok(value) => return Ok(value),
-                    Err(KVError::Deleted) => return Err(format!("Key {key} not found")),
-                    Err(KVError::NotFound) => continue,
+            for manifest_line in level_files.iter().rev() {
+                if level == 0 {
+                    let path = format!("{}/l{}/{}", self.data_dir, level, manifest_line.sst_name);
+                    match self.search_sstable(&path, key) {
+                        Ok(value) => return Ok(value),
+                        Err(KVError::Deleted) => return Err(format!("Key {key} not found")),
+                        Err(KVError::NotFound) => continue,
+                    }
+                } else if *key >= *manifest_line.start_key && *key <= *manifest_line.end_key {
+                    let path = format!("{}/l{}/{}", self.data_dir, level, manifest_line.sst_name);
+                    match self.search_sstable(&path, key) {
+                        Ok(value) => return Ok(value),
+                        Err(KVError::Deleted) => return Err(format!("Key {key} not found")),
+                        Err(KVError::NotFound) => continue,
+                    }
                 }
             }
         }
@@ -238,13 +254,24 @@ impl KVStore {
 
         let mut tmp = File::create(&tmp_path).unwrap();
         let mut all_sst_filenames = self.parse_manifest(&manifest_path);
-        all_sst_filenames[0].push(sst_name);
-        println!("{:?}", all_sst_filenames); 
+        all_sst_filenames[0].push(ManifestLine {
+            start_key: "NA".to_string(),
+            end_key: "NA".to_string(),
+            sst_name: sst_name,
+        });
 
         for (i, level_files) in all_sst_filenames.iter().enumerate() {
             writeln!(tmp, "[L{}]", i).unwrap();
-            for name in level_files {
-                writeln!(tmp, "{}", name).unwrap();
+            for manifest_line in level_files {
+                if i == 0 {
+                    writeln!(tmp, "{}", manifest_line.sst_name).unwrap();
+                } else {
+                    let line = format!(
+                        "{}-{}:{}",
+                        manifest_line.start_key, manifest_line.end_key, manifest_line.sst_name
+                    );
+                    writeln!(tmp, "{}", line).unwrap();
+                }
             }
         }
         tmp.sync_all().unwrap();
@@ -279,21 +306,21 @@ impl KVStore {
         self.compact_level(0, &mut all_sst_filenames);
     }
 
-    fn compact_level(&mut self, level: usize, all_sst_filenames: &mut Vec<Vec<String>>) {
+    fn compact_level(&mut self, level: usize, all_sst_filenames: &mut Vec<Vec<ManifestLine>>) {
         if level >= all_sst_filenames.len() || all_sst_filenames[level].len() < 5 {
             return;
         }
 
         // Snapshot the filenames to compact and clear the level
-        let sst_filenames: Vec<String> = all_sst_filenames[level].clone();
+        let sst_filenames: Vec<ManifestLine> = all_sst_filenames[level].clone();
         let mut sorted_filenames = sst_filenames.clone();
         sorted_filenames.reverse(); // newest first
         all_sst_filenames[level].clear();
 
         // Build iterators for each SSTable in this level
         let mut iters: Vec<Box<dyn Iterator<Item = (String, Info)>>> = vec![];
-        for sst_filename in sorted_filenames.iter() {
-            let path = format!("{}/l{}/{}", self.data_dir, level, sst_filename);
+        for manifest_line in sorted_filenames.iter() {
+            let path = format!("{}/l{}/{}", self.data_dir, level, manifest_line.sst_name);
             iters.push(Box::new(SSTableIter::new(&path)));
         }
 
@@ -345,7 +372,7 @@ impl KVStore {
         }
 
         // Write compacted output to next level
-        let mut next_level_sst_filenames: Vec<String> = Vec::new();
+        let mut next_level_sst_filenames: Vec<ManifestLine> = Vec::new();
         for chunk in output.chunks(2000) {
             let sst_name = format!("sst-{}.json", self.next_ids[next_level]);
             let sst_path = format!("{}/l{}/{}", self.data_dir, next_level, sst_name);
@@ -359,15 +386,19 @@ impl KVStore {
             self.fsync_parent_dir(Path::new(&sst_path)).unwrap();
 
             self.next_ids[next_level] += 1;
-            next_level_sst_filenames.push(sst_name);
+            next_level_sst_filenames.push(ManifestLine {
+                start_key: chunk[0].0.to_string(),
+                end_key: chunk[chunk.len() - 1].0.to_string(),
+                sst_name: sst_name,
+            });
         }
 
         // Append new files to existing next level list
         all_sst_filenames[next_level].extend(next_level_sst_filenames);
 
         // Delete old SSTable files from this level
-        for name in &sst_filenames {
-            let path = format!("{}/l{}/{}", self.data_dir, level, name);
+        for manifest_line in &sst_filenames {
+            let path = format!("{}/l{}/{}", self.data_dir, level, manifest_line.sst_name);
             fs::remove_file(&path).unwrap();
         }
 
@@ -377,8 +408,16 @@ impl KVStore {
         let mut tmp = File::create(&tmp_path).unwrap();
         for (i, level_files) in all_sst_filenames.iter().enumerate() {
             writeln!(tmp, "[L{}]", i).unwrap();
-            for name in level_files {
-                writeln!(tmp, "{}", name).unwrap();
+            for manifest_line in level_files {
+                if i == 0 {
+                    writeln!(tmp, "{}", manifest_line.sst_name).unwrap();
+                } else {
+                    let line = format!(
+                        "{}-{}:{}",
+                        manifest_line.start_key, manifest_line.end_key, manifest_line.sst_name
+                    );
+                    writeln!(tmp, "{}", line).unwrap();
+                }
             }
         }
         tmp.sync_all().unwrap();
@@ -391,18 +430,33 @@ impl KVStore {
         self.compact_level(next_level, all_sst_filenames);
     }
 
-    fn parse_manifest(&self, manifest_path: &str) -> Vec<Vec<String>> {
+    fn parse_manifest(&self, manifest_path: &str) -> Vec<Vec<ManifestLine>> {
         let file = File::open(manifest_path).unwrap();
         let reader = BufReader::new(file);
         let level_regex = Regex::new(r"^\[L\d+\]$").unwrap();
-        let mut all_sst_filenames: Vec<Vec<String>> = Vec::new();
+        let mut all_sst_filenames: Vec<Vec<ManifestLine>> = Vec::new();
 
         for line in reader.lines() {
             let line = line.unwrap();
             if level_regex.is_match(&line) {
                 all_sst_filenames.push(Vec::new());
             } else if !line.trim().is_empty() {
-                all_sst_filenames.last_mut().unwrap().push(line);
+                if all_sst_filenames.len() > 1 {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    let keys: Vec<&str> = parts[0].split('-').collect();
+
+                    all_sst_filenames.last_mut().unwrap().push(ManifestLine {
+                        start_key: keys[0].to_string(),
+                        end_key: keys[1].to_string(),
+                        sst_name: parts[1].to_string(),
+                    });
+                } else {
+                    all_sst_filenames.last_mut().unwrap().push(ManifestLine {
+                        start_key: "NA".to_string(),
+                        end_key: "NA".to_string(),
+                        sst_name: line,
+                    });
+                }
             }
         }
         all_sst_filenames
