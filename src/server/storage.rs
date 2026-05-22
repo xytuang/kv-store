@@ -201,15 +201,73 @@ impl KVStore {
     }
 
     fn search_sstable(&self, path: &str, key: &str) -> Result<String, KVError> {
-        for (k, info) in SSTableIter::new(path) {
-            if key == k {
-                if info.deleted {
-                    return Err(KVError::Deleted);
-                } else {
-                    return Ok(info.value);
-                }
+        // Convert key into a 64 byte array
+        let mut key_bytes = [0u8; 64];
+        let src = key.as_bytes();
+        let len = src.len().min(64);
+        key_bytes[..len].copy_from_slice(&src[..len]);
+
+        let index_buffer = SSTableIter::new(path).read();
+        let block_count = index_buffer[0] as u64;
+
+        // Binary search index block
+        let mut left_block = 0;
+        let mut right_block = block_count - 1;
+        let mut middle_block = 0;
+
+        while left_block <= right_block {
+            middle_block = (left_block + right_block) / 2;
+            let offset: usize = (64 + 64 * middle_block).try_into().unwrap();
+            let chunk: [u8; 64] = index_buffer[offset..offset + 64].try_into().unwrap();
+
+            if chunk == key_bytes {
+                break;
+            } else if chunk > key_bytes {
+                right_block = middle_block - 1;
+            } else {
+                left_block = middle_block + 1;
             }
         }
+
+        if left_block > right_block {
+            return Err(KVError::NotFound);
+        }
+
+        let block_offset: u64 = (middle_block + 1) * 4096;
+
+        let mut iter = SSTableIter::new(path);
+        iter.seek(block_offset);
+
+        let data_block_buffer = iter.read();
+
+        // Extract header
+        let _checksum: [u8; 8] = data_block_buffer[0..8].try_into().unwrap();
+        let entry_count: u64 = data_block_buffer[8] as u64;
+
+        // TODO: Checksum verification
+        // Binary search over data block
+        let mut left_key = 0;
+        let mut right_key = entry_count - 1;
+
+        while left_key <= right_key {
+            let curr_key = (left_key + right_key) / 2;
+            let offset: usize = (128 + 128 * curr_key).try_into().unwrap();
+            let found_key: [u8; 64] = index_buffer[offset..offset + 64].try_into().unwrap();
+
+            if found_key == key_bytes {
+                let value: [u8; 64] = index_buffer[offset + 64..offset + 128].try_into().unwrap();
+
+                if value == [0u8; 64] {
+                    return Err(KVError::Deleted);
+                }
+                return Ok(String::from_utf8(value.to_vec()).unwrap());
+            } else if found_key < key_bytes {
+                left_key = curr_key + 1;
+            } else {
+                right_key = curr_key - 1;
+            }
+        }
+
         Err(KVError::NotFound)
     }
 
@@ -229,7 +287,7 @@ impl KVStore {
             },
         ));
 
-        if self.memtable.len() == 2000 {
+        if self.memtable.len() == 1953 {
             self.flush();
             self.memtable.clear();
         }
@@ -373,7 +431,7 @@ impl KVStore {
 
         // Write compacted output to next level
         let mut next_level_sst_filenames: Vec<ManifestLine> = Vec::new();
-        for chunk in output.chunks(2000) {
+        for chunk in output.chunks(1953) {
             let sst_name = format!("sst-{}.json", self.next_ids[next_level]);
             let sst_path = format!("{}/l{}/{}", self.data_dir, next_level, sst_name);
             let mut sst_file = File::create(&sst_path).unwrap();

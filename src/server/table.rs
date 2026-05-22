@@ -4,7 +4,7 @@ use serde_json;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 #[derive(Deserialize, Serialize)]
 pub struct Entry {
@@ -100,9 +100,21 @@ pub struct SSTableIter {
 impl SSTableIter {
     pub fn new(path: &str) -> Self {
         let file = File::open(path).unwrap();
+
         Self {
             reader: BufReader::new(file),
         }
+    }
+
+    pub fn seek(&mut self, offset: u64) {
+        self.reader.seek(SeekFrom::Start(offset)).unwrap();
+    }
+
+    pub fn read(&mut self) -> [u8; 4096] {
+        let mut buffer = [0u8; 4096];
+        self.reader.read_exact(&mut buffer).unwrap();
+
+        buffer
     }
 }
 
