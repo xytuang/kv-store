@@ -293,16 +293,73 @@ impl KVStore {
         }
     }
 
+    fn str_to_64b_arr(&self, s: &str) -> [u8; 64] {
+        let mut buffer = [0u8; 64]; // Initialize with null bytes (0)
+        let bytes = s.as_bytes();
+
+        // Copy only up to 64 bytes to prevent panics if input is too long
+        let len = bytes.len().min(64);
+        buffer[..len].copy_from_slice(&bytes[..len]);
+        buffer
+    }
+
     fn flush(&mut self) {
         let sst_name = format!("sst-{}.json", self.next_ids[0]);
         let sst_path = format!("{}/l0/{}", self.data_dir, sst_name);
 
         // 1. Write and fsync the SSTable
         let mut sst_file: File = File::create(&sst_path).unwrap();
-        for (key, info) in MemtableIter::new(&self.memtable) {
-            let e = Entry::new(key, info);
-            writeln!(sst_file, "{}", e).unwrap();
+        // Create index block
+        let num_blocks = self.memtable.len().div_ceil(31);
+        // Write block count
+        sst_file.write_all(&[num_blocks as u8]).unwrap();
+        // Write padding
+        let padding = [0u8; 63];
+        sst_file.write_all(&padding).unwrap();
+
+        // Write every 32nd key
+        let mut num_entries = 0;
+        for (key, _) in MemtableIter::new(&self.memtable) {
+            if num_entries % 32 == 0 {
+                // Pad and write
+                let buffer = self.str_to_64b_arr(&key);
+                sst_file.write_all(&buffer).unwrap();
+            }
+            num_entries += 1;
         }
+
+        num_entries = 0;
+
+        let mut total_inserted = 0;
+        // Create data blocks
+        for (key, info) in MemtableIter::new(&self.memtable) {
+            // Write header, reset num_entries
+            if num_entries % 32 == 0 {
+                let mut header = [0u8; 128]; // Initialize with null bytes (0)
+                let entry_count = if self.memtable.len() - total_inserted >= 31 {
+                    31
+                } else {
+                    self.memtable.len() - total_inserted
+                };
+                header[8] = entry_count as u8;
+                sst_file.write_all(&header).unwrap();
+                num_entries = 0;
+            }
+            // Write key/info
+            let key_buffer = self.str_to_64b_arr(&key);
+            sst_file.write_all(&key_buffer).unwrap();
+
+            if info.deleted {
+                let val_buffer = [0u8; 64];
+                sst_file.write_all(&val_buffer).unwrap();
+            } else {
+                let val_buffer = self.str_to_64b_arr(&info.value);
+                sst_file.write_all(&val_buffer).unwrap();
+            }
+            num_entries += 1;
+            total_inserted += 1;
+        }
+
         sst_file.sync_all().unwrap();
         self.fsync_parent_dir(Path::new(&sst_path)).unwrap();
 
